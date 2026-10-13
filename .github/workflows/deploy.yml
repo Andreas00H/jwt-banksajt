@@ -1,0 +1,156 @@
+# CI/CD för banksajten med JWT-inloggning.
+# Körs vid push till main och vid pull requests mot main.
+# 1. Kontrollera frontend: lint och build.
+# 2. Kontrollera backend: syntax och enhetstester med Vitest.
+# 3. E2E-tester: starta hela stacken med en tom testdatabas och kör Playwright.
+# 4. Bara om ALLA tre är gröna, och bara vid push till main: deploya till EC2.
+
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  frontend:
+    name: Kontrollera frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run frontend lint
+        working-directory: ./frontend
+        run: npm run lint
+
+      - name: Build frontend
+        working-directory: ./frontend
+        run: npm run build
+
+  backend:
+    name: Kontrollera backend (Vitest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Check backend syntax
+        working-directory: ./backend
+        run: |
+          node --check server.js
+          node --check db.js
+          node --check src/validateAmount.js
+          node --check src/validateWithdrawal.js
+          node --check src/auth.js
+          node --check src/credentials.js
+
+      - name: Run Vitest
+        working-directory: ./backend
+        run: npm test
+
+  e2e:
+    name: E2E-tester (Playwright)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: ./frontend
+        run: npx playwright install --with-deps chromium
+
+      # Egen slumpad JWT-nyckel som bara finns under den här testkörningen.
+      # Produktionsnyckeln används aldrig i tester. add-mask döljer värdet i loggen.
+      - name: Create test JWT secret
+        run: |
+          secret="$(openssl rand -hex 32)"
+          echo "::add-mask::$secret"
+          echo "JWT_SECRET=$secret" >> "$GITHUB_ENV"
+
+      # Samma stack som i produktion, men med en tom databas i minnet (docker-compose.test.yml).
+      # --wait väntar tills alla tjänster är "healthy", så testerna startar först när sajten svarar.
+      - name: Start test environment (Docker Compose)
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build --wait --wait-timeout 300
+
+      - name: Run Playwright tests
+        working-directory: ./frontend
+        run: npm run test:e2e
+
+      - name: Show container logs if something failed
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml logs --tail 100
+
+      - name: Stop test environment
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml down --volumes
+
+  deploy:
+    name: Deploy till EC2
+    # Startar bara om ALLA kontroller och tester ovan lyckades
+    needs: [frontend, backend, e2e]
+    # Deploya bara vid push till main, aldrig vid pull requests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Bara en deploy åt gången. En ny push väntar tills den förra är klar.
+    concurrency:
+      group: deploy-ec2
+      cancel-in-progress: false
+
+    steps:
+      - name: Deploy med Docker Compose på EC2
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          # Next.js-bygget tar några minuter på servern
+          command_timeout: 30m
+          script: |
+            set -e
+            cd /home/ubuntu/jwt-banksajt
+            git pull
+            sudo docker compose up -d --build
+            sudo docker image prune -f
+            sudo docker builder prune -f --filter until=24h
+            sudo docker compose ps

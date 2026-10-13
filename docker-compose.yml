@@ -1,0 +1,100 @@
+services:
+  # Next.js – det enda som syns utåt. Anropar backend inuti Docker-nätverket.
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_URL: http://backend:3001
+    environment:
+      BACKEND_URL: http://backend:3001
+      # VG: feature flag för Sparmål. Sätts i .env på servern. Standard = av (false).
+      FEATURE_SAVINGS: ${FEATURE_SAVINGS:-false}
+    ports:
+      # Lokalt: http://localhost:3000. På servern sätts FRONTEND_PORT i en .env-fil.
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    # Räknas som "healthy" när startsidan svarar (används av docker compose up --wait)
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # Express – nås bara av frontend, via namnet "backend"
+  backend:
+    build:
+      context: ./backend
+    environment:
+      PORT: 3001
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: bank_app
+      DB_PASSWORD: bank_password
+      DB_NAME: bank
+      # Signeringsnyckeln för JWT. Läses från .env (lokalt och på EC2) eller från
+      # miljön (i GitHub Actions). Compose stoppar direkt om den saknas.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET saknas - lagg den i .env}
+      # true bara när sajten körs med HTTPS. Sajten på EC2 körs över HTTP.
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      # Frontendens exakta adress för CORS med cookies
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # Räknas som "healthy" när /health svarar, alltså när databasen går att nå
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # MySQL – datan sparas i en volym så att den finns kvar mellan omstarter
+  mysql:
+    image: mysql:8.4
+    # Mindre minnesanvändning (servern har bara 1 GB RAM)
+    command: ["--performance-schema=OFF", "--innodb-buffer-pool-size=64M"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: bank
+      MYSQL_USER: bank_app
+      MYSQL_PASSWORD: bank_password
+    ports:
+      # Bara för att kunna titta i databasen från den egna datorn (localhost:3307).
+      # På servern sätts MYSQL_PORT i .env så att porten inte krockar med andra projekt.
+      - "${MYSQL_PORT:-127.0.0.1:3307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          # 127.0.0.1 (inte localhost) så att den bara svarar när MySQL tar emot nätverksanslutningar
+          "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

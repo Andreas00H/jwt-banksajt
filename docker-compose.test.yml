@@ -1,0 +1,26 @@
+# Testmiljö för Playwright. Används TILLSAMMANS med docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build --wait
+#
+# Skillnader mot den vanliga miljön:
+# - eget projektnamn, så att containrarna inte krockar med den vanliga banken
+# - databasen ligger bara i minnet (tmpfs) och är tom varje gång,
+#   så testerna rör aldrig den riktiga databasvolymen
+# - frontend på 127.0.0.1:3100 och ingen öppen MySQL-port
+name: bank-test
+
+services:
+  frontend:
+    environment:
+      FEATURE_SAVINGS: "false"
+    ports: !override
+      - "127.0.0.1:3100:3000"
+
+  mysql:
+    # fsync i stället för O_DIRECT, eftersom tmpfs (minnet) inte stöder O_DIRECT
+    command:
+      ["--performance-schema=OFF", "--innodb-buffer-pool-size=64M", "--innodb-flush-method=fsync"]
+    ports: !reset []
+    volumes: !override
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    tmpfs:
+      - /var/lib/mysql
